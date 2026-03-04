@@ -1,0 +1,17 @@
+[Unit]
+Description=Car Parser Telegram Bot
+After=network.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=YOUR_USERNAME
+WorkingDirectory=/home/YOUR_USERNAME/car_parser
+ExecStart=/home/YOUR_USERNAME/car_parser/venv/bin/python bot.py
+Restart=always
+RestartSec=30
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

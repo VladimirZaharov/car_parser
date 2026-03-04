@@ -1,0 +1,41 @@
+{
+  "telegram": {
+    "bot_token": "YOUR_BOT_TOKEN_HERE",
+    "chat_id": "YOUR_CHAT_ID_HERE"
+  },
+
+  "interval_minutes": 30,
+
+  "search_queries": [
+    {
+      "name": "Toyota Camry до 2млн",
+      "sources": ["avito", "autoru"],
+      "brand": "toyota",
+      "model": "camry",
+      "year_min": 2018,
+      "year_max": 2023,
+      "price_min": 1000000,
+      "price_max": 2000000,
+      "mileage_max": 100000,
+      "region": "moskva"
+    },
+    {
+      "name": "BMW 3 series бюджет",
+      "sources": ["avito", "autoru"],
+      "brand": "bmw",
+      "model": "3_seriya",
+      "year_min": 2017,
+      "price_max": 2500000,
+      "region": "sankt-peterburg"
+    },
+    {
+      "name": "Honda CR-V по всей России",
+      "sources": ["avito"],
+      "brand": "honda",
+      "model": "cr-v",
+      "year_min": 2019,
+      "price_max": 3000000,
+      "region": "rossiya"
+    }
+  ]
+}
