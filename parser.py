@@ -70,8 +70,10 @@ def _make_options(proxy_url: str = "", headless: bool = True) -> Options:
     opts.add_argument("--disable-software-rasterizer")
     opts.add_argument("--disable-extensions")
     opts.add_argument("--disable-setuid-sandbox")
-    opts.add_argument("--single-process")               # стабильнее на VPS с ограниченной памятью
-    opts.add_argument("--no-zygote")                    # отключить zygote-процесс (нужно при --single-process)
+    opts.add_argument("--disable-crash-reporter")
+    opts.add_argument("--disable-in-process-stack-traces")
+    
+    
     opts.add_argument("--remote-debugging-port=0")      # случайный порт, без конфликтов
 
     # ── размер окна и локаль ──

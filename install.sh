@@ -102,8 +102,6 @@ opts.add_argument("--no-sandbox")
 opts.add_argument("--disable-dev-shm-usage")
 opts.add_argument("--disable-gpu")
 opts.add_argument("--disable-software-rasterizer")
-opts.add_argument("--single-process")
-opts.add_argument("--no-zygote")
 opts.add_argument("--window-size=1920,1080")
 
 # Пробуем chromedriver из PATH (установлен выше через apt/wget)
