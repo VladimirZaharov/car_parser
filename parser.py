@@ -1,12 +1,6 @@
 """
-parser.py  —  Selenium-парсер для Avito и Auto.ru
-──────────────────────────────────────────────────
-Оба сайта открываются в headless Chrome.
-Имитируется поведение живого пользователя:
-  • случайные паузы между действиями
-  • плавный скролл страницы
-  • патч navigator.webdriver = undefined
-  • ротация User-Agent при каждом запуске
+parser.py  —  Selenium-парсер Avito + Auto.ru
+Работает на Ubuntu-сервере без GUI (headless Chrome).
 """
 
 import json
@@ -21,23 +15,31 @@ from urllib.parse import urlencode
 
 from bs4 import BeautifulSoup
 from selenium import webdriver
-from selenium.common.exceptions import TimeoutException, WebDriverException, NoSuchElementException
+from selenium.common.exceptions import (
+    NoSuchElementException, TimeoutException, WebDriverException,
+)
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
+# webdriver-manager сам скачивает ChromeDriver под вашу версию Chrome
+try:
+    from webdriver_manager.chrome import ChromeDriverManager
+    _WDM_AVAILABLE = True
+except ImportError:
+    _WDM_AVAILABLE = False
+
 logger = logging.getLogger(__name__)
 
-# ─────────────────────────────────────────────────────────────────── #
+# ──────────────────────────────────────────────────────────────────── #
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_3) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.3 Safari/605.1.15",
 ]
 
 _STEALTH_JS = """
@@ -55,44 +57,106 @@ def _jitter(base: float, spread: float = 0.35) -> float:
 
 def _make_options(proxy_url: str = "", headless: bool = True) -> Options:
     opts = Options()
+
     if headless:
+        # --headless=new требует Chrome 112+
+        # Если вдруг старый Chrome — попробуем оба варианта
         opts.add_argument("--headless=new")
-    opts.add_argument("--no-sandbox")
-    opts.add_argument("--disable-dev-shm-usage")
-    opts.add_argument("--disable-gpu")
+
+    # ── обязательные флаги для серверного запуска ──
+    opts.add_argument("--no-sandbox")                    # без этого Chrome не стартует под root / в контейнере
+    opts.add_argument("--disable-dev-shm-usage")         # /dev/shm часто мал на серверах → используем /tmp
+    opts.add_argument("--disable-gpu")                   # GPU не нужен в headless
+    opts.add_argument("--disable-software-rasterizer")
+    opts.add_argument("--disable-extensions")
+    opts.add_argument("--disable-setuid-sandbox")
+    opts.add_argument("--single-process")               # стабильнее на VPS с ограниченной памятью
+    opts.add_argument("--no-zygote")                    # отключить zygote-процесс (нужно при --single-process)
+    opts.add_argument("--remote-debugging-port=0")      # случайный порт, без конфликтов
+
+    # ── размер окна и локаль ──
     opts.add_argument("--window-size=1920,1080")
+    opts.add_argument("--lang=ru-RU,ru")
+    opts.add_argument("--accept-lang=ru-RU,ru")
+
+    # ── маскировка под живой браузер ──
     opts.add_argument("--disable-blink-features=AutomationControlled")
     opts.add_argument(f"--user-agent={random.choice(USER_AGENTS)}")
-    opts.add_argument("--lang=ru-RU,ru")
+    opts.add_experimental_option("excludeSwitches", ["enable-automation", "enable-logging"])
+    opts.add_experimental_option("useAutomationExtension", False)
+
+    # ── прочее ──
     opts.add_argument("--disable-notifications")
     opts.add_argument("--disable-popup-blocking")
     opts.add_argument("--ignore-certificate-errors")
     opts.add_argument("--log-level=3")
-    opts.add_experimental_option("excludeSwitches", ["enable-automation", "enable-logging"])
-    opts.add_experimental_option("useAutomationExtension", False)
+    opts.add_argument("--silent")
+
     opts.add_experimental_option("prefs", {
         "profile.default_content_setting_values.notifications": 2,
         "credentials_enable_service": False,
+        # Не загружать картинки — быстрее и меньше трафика
+        "profile.managed_default_content_settings.images": 2,
     })
+
     if proxy_url:
         opts.add_argument(f"--proxy-server={proxy_url}")
+
     return opts
+
+
+def _make_service() -> Service:
+    """Создаёт Service: если есть webdriver-manager — использует его,
+    иначе полагается на chromedriver в PATH."""
+    if _WDM_AVAILABLE:
+        try:
+            driver_path = ChromeDriverManager().install()
+            logger.info(f"ChromeDriver: {driver_path}")
+            return Service(driver_path)
+        except Exception as e:
+            logger.warning(f"webdriver-manager не смог скачать драйвер ({e}), пробуем из PATH...")
+    return Service()
 
 
 @contextmanager
 def _driver_ctx(proxy_url: str = "", headless: bool = True):
+    """Контекст-менеджер: открывает Chrome, применяет stealth-патч, закрывает при выходе."""
     driver = None
     try:
         opts    = _make_options(proxy_url=proxy_url, headless=headless)
-        service = Service()
+        service = _make_service()
         driver  = webdriver.Chrome(service=service, options=opts)
-        driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {"source": _STEALTH_JS})
+
+        # Применяем патч ДО загрузки любой страницы
+        driver.execute_cdp_cmd(
+            "Page.addScriptToEvaluateOnNewDocument",
+            {"source": _STEALTH_JS}
+        )
         driver.set_page_load_timeout(50)
         driver.implicitly_wait(4)
+
+        logger.info("Chrome запущен успешно")
         yield driver
+
     except WebDriverException as e:
-        logger.error(f"Chrome WebDriver: не удалось запустить — {e}")
-        yield None
+        # Попытка с --headless (старый синтаксис) если новый не сработал
+        logger.warning(f"Chrome с --headless=new упал ({e}), пробуем старый --headless...")
+        try:
+            opts = _make_options(proxy_url=proxy_url, headless=False)
+            opts.add_argument("--headless")              # старый флаг (Chrome < 112)
+            service = _make_service()
+            driver  = webdriver.Chrome(service=service, options=opts)
+            driver.execute_cdp_cmd(
+                "Page.addScriptToEvaluateOnNewDocument",
+                {"source": _STEALTH_JS}
+            )
+            driver.set_page_load_timeout(50)
+            driver.implicitly_wait(4)
+            logger.info("Chrome запущен (старый headless-режим)")
+            yield driver
+        except WebDriverException as e2:
+            logger.error(f"Chrome не удалось запустить: {e2}")
+            yield None
     finally:
         if driver:
             try:
@@ -102,16 +166,21 @@ def _driver_ctx(proxy_url: str = "", headless: bool = True):
 
 
 def _scroll_page(driver, steps: int = 6):
-    total = driver.execute_script("return document.body.scrollHeight")
-    step  = total // steps
-    for i in range(1, steps + 1):
-        driver.execute_script(f"window.scrollTo(0, {step * i});")
-        time.sleep(_jitter(1.1, 0.5))
-    driver.execute_script("window.scrollTo(0, 400);")
-    time.sleep(_jitter(0.8))
+    """Плавный скролл вниз с рандомными паузами."""
+    try:
+        total = driver.execute_script("return document.body.scrollHeight") or 3000
+        step  = total // steps
+        for i in range(1, steps + 1):
+            driver.execute_script(f"window.scrollTo(0, {step * i});")
+            time.sleep(_jitter(1.1, 0.5))
+        driver.execute_script("window.scrollTo(0, 400);")
+        time.sleep(_jitter(0.8))
+    except Exception:
+        pass
 
 
 def _wait_for_any(driver, selectors: list, timeout: int = 20) -> Optional[str]:
+    """Ждёт первый из CSS-селекторов, возвращает нашедший."""
     end = time.time() + timeout
     while time.time() < end:
         for sel in selectors:
@@ -133,6 +202,8 @@ def _is_blocked(driver) -> bool:
 
 
 # ═══════════════════════════════════════════════════════════════════ #
+#  CarParser                                                          #
+# ═══════════════════════════════════════════════════════════════════ #
 class CarParser:
     def __init__(self, config: dict):
         self.config    = config
@@ -140,7 +211,9 @@ class CarParser:
         self.proxy_url = proxy_cfg.get("url", "")
         self.headless  = config.get("selenium_headless", True)
 
-    # ─── AVITO ──────────────────────────────────────────────────── #
+    # ────────────────────────────────────────────────────────────── #
+    #  AVITO                                                         #
+    # ────────────────────────────────────────────────────────────── #
     def build_avito_url(self, p: dict) -> str:
         region = p.get("region", "rossiya")
         brand  = p.get("brand", "").lower().replace(" ", "_")
@@ -178,26 +251,30 @@ class CarParser:
         try:
             driver.get(url)
             time.sleep(_jitter(4, 0.3))
+
             if _is_blocked(driver):
-                logger.warning("[Avito] Обнаружена капча/блокировка. Ждём 40s и обновляем...")
+                logger.warning("[Avito] Капча/блокировка. Ждём 40s...")
                 time.sleep(_jitter(40, 0.15))
                 driver.refresh()
                 time.sleep(_jitter(8, 0.3))
+
             card_sel = _wait_for_any(driver, [
                 "[data-marker='item']",
                 "[class*='iva-item-root']",
                 "div[class*='items-items'] > div",
             ], timeout=20)
+
             if card_sel:
                 _scroll_page(driver)
             else:
                 logger.warning("[Avito] Карточки не появились, пробуем JSON-LD")
+
             soup = BeautifulSoup(driver.page_source, "lxml")
             ads  = self._avito_jsonld(soup)
             if not ads:
                 ads = self._avito_html(soup)
         except WebDriverException as e:
-            logger.error(f"[Avito] Selenium error: {e}")
+            logger.error(f"[Avito] Ошибка: {e}")
         return ads
 
     @staticmethod
@@ -206,7 +283,8 @@ class CarParser:
         for tag in soup.find_all("script", type="application/ld+json"):
             try:
                 data  = json.loads(tag.string or "")
-                items = data.get("itemListElement", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
+                items = (data.get("itemListElement", []) if isinstance(data, dict)
+                         else (data if isinstance(data, list) else []))
                 for it in items:
                     item  = it.get("item", it)
                     url   = item.get("url", "")
@@ -218,7 +296,8 @@ class CarParser:
                         "id":       f"avito_{mid.group(1) if mid else url}",
                         "source":   "Avito",
                         "title":    item.get("name", "—"),
-                        "price":    f"{price} ₽" if str(price).isdigit() else str(price or "Цена не указана"),
+                        "price":    (f"{price} ₽" if str(price).isdigit()
+                                     else str(price or "Цена не указана")),
                         "url":      url,
                         "location": item.get("availableAtOrFrom", {}).get("name", ""),
                         "found_at": datetime.now().isoformat(),
@@ -240,22 +319,27 @@ class CarParser:
             if not ad_id:
                 continue
             title_el = item.select_one("[itemprop='name'], [class*='title-root'], h3, h2")
-            price_el = item.select_one("[itemprop='price'], [class*='price-text'], [class*='price_value'], [class*='price-root']")
-            link_el  = item.select_one("a[href*='/avtomobili/']") or item.select_one("a[data-marker='item-title']")
-            geo_el   = item.select_one("[class*='geo-root'], [class*='location'], [data-marker='item-address']")
+            price_el = item.select_one(
+                "[itemprop='price'], [class*='price-text'], [class*='price_value'], [class*='price-root']")
+            link_el  = (item.select_one("a[href*='/avtomobili/']") or
+                        item.select_one("a[data-marker='item-title']"))
+            geo_el   = item.select_one(
+                "[class*='geo-root'], [class*='location'], [data-marker='item-address']")
             href = link_el["href"] if link_el else ""
             ads.append({
                 "id":       f"avito_{ad_id}",
                 "source":   "Avito",
                 "title":    title_el.get_text(strip=True) if title_el else "—",
                 "price":    price_el.get_text(strip=True) if price_el else "Цена не указана",
-                "url":      f"https://www.avito.ru{href}" if href.startswith("/") else href,
-                "location": geo_el.get_text(strip=True)  if geo_el   else "",
+                "url":      (f"https://www.avito.ru{href}" if href.startswith("/") else href),
+                "location": geo_el.get_text(strip=True)   if geo_el   else "",
                 "found_at": datetime.now().isoformat(),
             })
         return ads
 
-    # ─── AUTO.RU ────────────────────────────────────────────────── #
+    # ────────────────────────────────────────────────────────────── #
+    #  AUTO.RU                                                       #
+    # ────────────────────────────────────────────────────────────── #
     _BRAND_SLUG = {
         "mitsubishi": "mitsubishi", "toyota": "toyota", "bmw": "bmw",
         "honda": "honda", "kia": "kia", "hyundai": "hyundai",
@@ -306,29 +390,35 @@ class CarParser:
         try:
             driver.get(url)
             time.sleep(_jitter(4, 0.3))
+
             if _is_blocked(driver):
-                logger.warning("[Auto.ru] Обнаружена капча/блокировка. Ждём 40s...")
+                logger.warning("[Auto.ru] Капча/блокировка. Ждём 40s...")
                 time.sleep(_jitter(40, 0.15))
                 driver.refresh()
                 time.sleep(_jitter(8, 0.3))
+
             self._autoru_accept_cookies(driver)
+
             card_sel = _wait_for_any(driver, [
                 "div.ListingItem",
                 "article.ListingItem",
                 "div[class*='ListingItem_']",
                 "div[class*='listing-item']",
             ], timeout=25)
+
             if not card_sel:
                 logger.warning("[Auto.ru] Карточки не найдены, пробуем JSON из страницы")
                 soup = BeautifulSoup(driver.page_source, "lxml")
                 return self._autoru_from_page_json(soup)
+
             _scroll_page(driver)
+
             soup = BeautifulSoup(driver.page_source, "lxml")
             ads  = self._autoru_from_page_json(soup)
             if not ads:
                 ads = self._autoru_from_html(soup)
         except WebDriverException as e:
-            logger.error(f"[Auto.ru] Selenium error: {e}")
+            logger.error(f"[Auto.ru] Ошибка: {e}")
         return ads
 
     @staticmethod
@@ -350,7 +440,7 @@ class CarParser:
     def _autoru_from_page_json(soup: BeautifulSoup) -> list:
         ads = []
         for tag in soup.find_all("script"):
-            src = tag.string or ""
+            src   = tag.string or ""
             match = re.search(r'"offers"\s*:\s*(\[.*?\])\s*[,}]', src, re.DOTALL)
             if not match:
                 continue
@@ -370,7 +460,8 @@ class CarParser:
     def _autoru_from_html(soup: BeautifulSoup) -> list:
         ads   = []
         items = []
-        for sel in ["div.ListingItem", "article.ListingItem", "div[class*='ListingItem_']", "div[class*='listing-item']"]:
+        for sel in ["div.ListingItem", "article.ListingItem",
+                    "div[class*='ListingItem_']", "div[class*='listing-item']"]:
             items = soup.select(sel)
             if items:
                 break
@@ -402,8 +493,8 @@ class CarParser:
                 m        = re.search(r"/sale/[^/]+/[^/]+/(\d+-[a-f0-9]+)/", href)
                 oid      = m.group(1) if m else href
                 title_el = item.select_one(".ListingItemTitle__link, [class*='ItemTitle'], [class*='title'], h3, h2")
-                price_el = item.select_one(".ListingItem__priceValue, [class*='Price_'], [class*='price-value'], [class*='Price__content']")
-                geo_el   = item.select_one(".MetroListPlace__regionName, [class*='Place_'], [class*='place'], [class*='region']")
+                price_el = item.select_one(".ListingItem__priceValue, [class*='Price_'], [class*='price-value']")
+                geo_el   = item.select_one(".MetroListPlace__regionName, [class*='Place_'], [class*='region']")
                 year_el  = item.select_one("[class*='year'], .ListingItem__yearMileage")
                 km_el    = item.select_one("[class*='mileage'], [class*='km']")
                 ads.append({
@@ -436,8 +527,9 @@ class CarParser:
             car.get("model_info", {}).get("name", ""),
             str(docs.get("year", "")),
         ])) or "—"
-        price_str = f"{price:,}".replace(",", "\u00a0") + "\u00a0\u20bd" if price else "Цена не указана"
-        region    = loc.get("region_info", {}).get("name", "") or loc.get("city_name", "")
+        price_str = (f"{price:,}".replace(",", "\u00a0") + "\u00a0\u20bd"
+                     if price else "Цена не указана")
+        region = loc.get("region_info", {}).get("name", "") or loc.get("city_name", "")
         return {
             "id":       f"autoru_{oid}",
             "source":   "Auto.ru",
