@@ -6,6 +6,12 @@
 
   "interval_minutes": 30,
 
+  "selenium_headless": true,
+
+  "proxy": {
+    "url": ""
+  },
+
   "search_queries": [
     {
       "name": "mitsubishi outlander",

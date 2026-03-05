@@ -1,104 +1,60 @@
-# 🚗 Car Parser Bot — Руководство по установке
+# 🚗 Car Parser Bot — Selenium Edition
 
-## Требования
-- Ubuntu 21+ (или 20.04 LTS)
-- Python 3.9+
-- Telegram бот (получить у @BotFather)
+Парсер Avito и Auto.ru через headless Chrome. Обходит 429 и антибот-защиту.
 
 ---
 
-## Шаг 1 — Получить Telegram токен и Chat ID
+## Установка на Ubuntu 21+
 
-### 1.1 Создать бота
-1. Открыть Telegram → найти **@BotFather**
-2. Отправить `/newbot`
-3. Придумать имя и username для бота
-4. Скопировать **токен** (вида `123456789:ABCdef...`)
-
-### 1.2 Узнать Chat ID
-1. Написать своему боту любое сообщение
-2. Открыть в браузере:
-   ```
-   https://api.telegram.org/bot<ВАШ_ТОКЕН>/getUpdates
-   ```
-3. Найти поле `"chat":{"id": XXXXXXXXX}` — это ваш **Chat ID**
-
-> Для группы: добавьте бота в группу, напишите сообщение,
-> Chat ID будет отрицательным числом, например `-1001234567890`
-
----
-
-## Шаг 2 — Установка на Ubuntu
+### 1. Установить зависимости системы
 
 ```bash
-# Обновить пакеты
 sudo apt update && sudo apt upgrade -y
 
-# Установить Python и pip
-sudo apt install python3 python3-pip python3-venv git -y
+# Python
+sudo apt install python3 python3-pip python3-venv -y
 
-# Клонировать / скопировать проект
+# Google Chrome
+wget -q -O /tmp/chrome.deb https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
+sudo apt install /tmp/chrome.deb -y
+
+# ChromeDriver (совпадает с версией Chrome автоматически через webdriver-manager)
+sudo apt install chromium-chromedriver -y
+```
+
+### 2. Скопировать файлы проекта
+
+```bash
 mkdir -p ~/car_parser
-# Скопируйте все файлы проекта в ~/car_parser/
+# Скопируйте все файлы в ~/car_parser/
 cd ~/car_parser
+```
 
-# Создать виртуальное окружение
+### 3. Создать виртуальное окружение и установить зависимости
+
+```bash
 python3 -m venv venv
 source venv/bin/activate
-
-# Установить зависимости
 pip install -r requirements.txt
 ```
 
----
-
-## Шаг 3 — Настройка config.json
-
-Отредактируйте файл `config.json`:
+### 4. Настроить config.json
 
 ```bash
-nano ~/car_parser/config.json
+nano config.json
 ```
 
-Заполните:
-```json
-{
-  "telegram": {
-    "bot_token": "123456789:ABCdefGHIjklMNOpqrsTUVwxyz",
-    "chat_id": "987654321"
-  },
-  "interval_minutes": 30,
-  "search_queries": [
-    {
-      "name": "Toyota Camry Москва",
-      "sources": ["avito", "autoru"],
-      "brand": "toyota",
-      "model": "camry",
-      "year_min": 2018,
-      "price_max": 2000000,
-      "region": "moskva"
-    }
-  ]
-}
-```
+Обязательно заполните:
+- `telegram.bot_token` — токен от @BotFather
+- `telegram.chat_id` — ваш Chat ID (узнать: написать боту, открыть `https://api.telegram.org/bot<TOKEN>/getUpdates`)
 
-### Параметры запроса:
-| Параметр | Описание | Пример |
+Параметры Selenium:
+| Параметр | Описание | По умолчанию |
 |---|---|---|
-| `name` | Название запроса для уведомлений | `"Toyota Camry"` |
-| `sources` | Площадки для парсинга | `["avito", "autoru"]` |
-| `brand` | Марка авто (латиницей) | `"toyota"`, `"bmw"`, `"honda"` |
-| `model` | Модель (латиницей) | `"camry"`, `"x5"`, `"cr-v"` |
-| `year_min` | Год от | `2018` |
-| `year_max` | Год до | `2023` |
-| `price_min` | Цена от (руб) | `500000` |
-| `price_max` | Цена до (руб) | `2000000` |
-| `mileage_max` | Пробег до (км) | `100000` |
-| `region` | Регион Avito | `"moskva"`, `"rossiya"` |
+| `selenium_headless` | `true` = без окна, `false` = с окном | `true` |
+| `proxy.url` | Прокси, например `socks5://user:pass@host:1080` | пусто |
 
----
-
-## Шаг 4 — Тестовый запуск
+### 5. Тестовый запуск
 
 ```bash
 cd ~/car_parser
@@ -106,22 +62,22 @@ source venv/bin/activate
 python bot.py
 ```
 
-Если всё настроено правильно — в Telegram придёт сообщение:
+Если всё верно — в Telegram придёт:
 > ✅ **Парсер запущен!**
+> 🌐 Режим: Selenium (headless Chrome)
 
 ---
 
-## Шаг 5 — Автозапуск через systemd
+## Автозапуск через systemd
 
 ```bash
-# Скопировать service-файл (замените YOUR_USERNAME на своё имя пользователя)
+# Скопировать service-файл
 sudo cp ~/car_parser/car_parser.service /etc/systemd/system/
 
-# Отредактировать service-файл — вставить правильный username
-sudo nano /etc/systemd/system/car_parser.service
-# Замените оба вхождения YOUR_USERNAME на своё имя пользователя Ubuntu
+# Заменить YOUR_USERNAME на ваш логин (например ubuntu или user1)
+sudo sed -i 's/YOUR_USERNAME/'"$USER"'/g' /etc/systemd/system/car_parser.service
 
-# Активировать и запустить
+# Включить и запустить
 sudo systemctl daemon-reload
 sudo systemctl enable car_parser
 sudo systemctl start car_parser
@@ -130,48 +86,52 @@ sudo systemctl start car_parser
 sudo systemctl status car_parser
 ```
 
-### Управление сервисом:
+### Управление сервисом
+
 ```bash
 sudo systemctl stop car_parser      # остановить
 sudo systemctl restart car_parser   # перезапустить
-sudo journalctl -u car_parser -f    # смотреть логи в реальном времени
+sudo journalctl -u car_parser -f    # логи в реальном времени
+tail -f ~/car_parser/car_parser.log # лог приложения
 ```
 
 ---
 
-## Просмотр логов
+## Как работает Selenium-режим
 
+1. Для каждого запроса открывается **отдельный экземпляр Chrome**
+2. Применяется патч `navigator.webdriver = undefined` — сайт не определяет автоматизацию
+3. Страница скроллится вниз (6 шагов) с паузами — имитация человека
+4. Данные извлекаются из **JSON-LD** (встроенные данные) или через **CSS-селекторы**
+5. При обнаружении капчи — пауза 40 сек + обновление страницы
+6. Chrome закрывается после каждого запроса
+
+## Отладка с видимым браузером
+
+Если нужно визуально посмотреть что происходит — установите в config.json:
+```json
+"selenium_headless": false
+```
+Для Ubuntu без GUI нужен виртуальный дисплей:
 ```bash
-# Лог приложения
-tail -f ~/car_parser/car_parser.log
-
-# Системный лог
-sudo journalctl -u car_parser -n 50
+sudo apt install xvfb -y
+Xvfb :99 -screen 0 1920x1080x24 &
+export DISPLAY=:99
+python bot.py
 ```
-
----
 
 ## Устранение неполадок
 
-### Бот не отправляет сообщения
-- Проверьте токен и chat_id в `config.json`
-- Убедитесь что вы написали боту хотя бы одно сообщение
-
-### Объявления не находятся
-- Avito и Auto.ru могут блокировать запросы — это нормально
-- Парсер повторит попытку на следующем цикле
-- Попробуйте увеличить `interval_minutes` до 60
-
-### Ошибка при установке зависимостей
+**`chromedriver` не найден:**
 ```bash
-pip install --upgrade pip
-pip install -r requirements.txt
+pip install webdriver-manager
+# В parser.py уже используется Service() — он найдёт chromedriver автоматически
+# если нужно явно: from webdriver_manager.chrome import ChromeDriverManager
+#                  service = Service(ChromeDriverManager().install())
 ```
 
----
+**Chrome падает на сервере без GUI:**
+Убедитесь что в config.json стоит `"selenium_headless": true`
 
-## ⚠️ Важно
-
-Парсинг Avito и Auto.ru может нарушать их **условия использования**.
-Используйте бота в личных некоммерческих целях и с разумными интервалами
-(не чаще 1 раза в 15 минут), чтобы не перегружать серверы.
+**Капча не проходит:**
+Попробуйте прокси (раздел `proxy.url` в config.json) или увеличьте `interval_minutes` до 60.

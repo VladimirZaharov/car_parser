@@ -1,441 +1,451 @@
+"""
+parser.py  —  Selenium-парсер для Avito и Auto.ru
+──────────────────────────────────────────────────
+Оба сайта открываются в headless Chrome.
+Имитируется поведение живого пользователя:
+  • случайные паузы между действиями
+  • плавный скролл страницы
+  • патч navigator.webdriver = undefined
+  • ротация User-Agent при каждом запуске
+"""
+
 import json
 import logging
 import random
 import re
 import time
+from contextlib import contextmanager
 from datetime import datetime
 from typing import Optional
+from urllib.parse import urlencode
 
-import requests
 from bs4 import BeautifulSoup
+from selenium import webdriver
+from selenium.common.exceptions import TimeoutException, WebDriverException, NoSuchElementException
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.support.ui import WebDriverWait
 
 logger = logging.getLogger(__name__)
 
-# ──────────────────────────────────────────────────────────────
-#  Пул User-Agent для ротации
-# ──────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────── #
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:123.0) Gecko/20100101 Firefox/123.0",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_3_1) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.3.1 Safari/605.1.15",
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_3) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.3 Safari/605.1.15",
 ]
 
-
-def _random_ua() -> str:
-    return random.choice(USER_AGENTS)
-
-
-def _sleep(min_s: float = 3.0, max_s: float = 8.0):
-    """Случайная пауза между запросами, чтобы не триггерить rate-limit."""
-    delay = random.uniform(min_s, max_s)
-    logger.debug(f"Sleeping {delay:.1f}s...")
-    time.sleep(delay)
+_STEALTH_JS = """
+Object.defineProperty(navigator, 'webdriver',   {get: () => undefined});
+Object.defineProperty(navigator, 'plugins',     {get: () => [1, 2, 3, 4, 5]});
+Object.defineProperty(navigator, 'languages',   {get: () => ['ru-RU', 'ru', 'en-US', 'en']});
+Object.defineProperty(navigator, 'platform',    {get: () => 'Win32'});
+window.chrome = {runtime: {}, loadTimes: function(){}, csi: function(){}, app: {}};
+"""
 
 
-# ──────────────────────────────────────────────────────────────
+def _jitter(base: float, spread: float = 0.35) -> float:
+    return max(0.3, base + random.uniform(-spread * base, spread * base))
+
+
+def _make_options(proxy_url: str = "", headless: bool = True) -> Options:
+    opts = Options()
+    if headless:
+        opts.add_argument("--headless=new")
+    opts.add_argument("--no-sandbox")
+    opts.add_argument("--disable-dev-shm-usage")
+    opts.add_argument("--disable-gpu")
+    opts.add_argument("--window-size=1920,1080")
+    opts.add_argument("--disable-blink-features=AutomationControlled")
+    opts.add_argument(f"--user-agent={random.choice(USER_AGENTS)}")
+    opts.add_argument("--lang=ru-RU,ru")
+    opts.add_argument("--disable-notifications")
+    opts.add_argument("--disable-popup-blocking")
+    opts.add_argument("--ignore-certificate-errors")
+    opts.add_argument("--log-level=3")
+    opts.add_experimental_option("excludeSwitches", ["enable-automation", "enable-logging"])
+    opts.add_experimental_option("useAutomationExtension", False)
+    opts.add_experimental_option("prefs", {
+        "profile.default_content_setting_values.notifications": 2,
+        "credentials_enable_service": False,
+    })
+    if proxy_url:
+        opts.add_argument(f"--proxy-server={proxy_url}")
+    return opts
+
+
+@contextmanager
+def _driver_ctx(proxy_url: str = "", headless: bool = True):
+    driver = None
+    try:
+        opts    = _make_options(proxy_url=proxy_url, headless=headless)
+        service = Service()
+        driver  = webdriver.Chrome(service=service, options=opts)
+        driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {"source": _STEALTH_JS})
+        driver.set_page_load_timeout(50)
+        driver.implicitly_wait(4)
+        yield driver
+    except WebDriverException as e:
+        logger.error(f"Chrome WebDriver: не удалось запустить — {e}")
+        yield None
+    finally:
+        if driver:
+            try:
+                driver.quit()
+            except Exception:
+                pass
+
+
+def _scroll_page(driver, steps: int = 6):
+    total = driver.execute_script("return document.body.scrollHeight")
+    step  = total // steps
+    for i in range(1, steps + 1):
+        driver.execute_script(f"window.scrollTo(0, {step * i});")
+        time.sleep(_jitter(1.1, 0.5))
+    driver.execute_script("window.scrollTo(0, 400);")
+    time.sleep(_jitter(0.8))
+
+
+def _wait_for_any(driver, selectors: list, timeout: int = 20) -> Optional[str]:
+    end = time.time() + timeout
+    while time.time() < end:
+        for sel in selectors:
+            try:
+                driver.find_element(By.CSS_SELECTOR, sel)
+                return sel
+            except NoSuchElementException:
+                pass
+        time.sleep(0.5)
+    return None
+
+
+def _is_blocked(driver) -> bool:
+    src = driver.page_source.lower()
+    return any(kw in src for kw in (
+        "captcha", "antibot", "blocked", "доступ ограничен",
+        "подозрительная активность", "robot", "recaptcha",
+    ))
+
+
+# ═══════════════════════════════════════════════════════════════════ #
 class CarParser:
     def __init__(self, config: dict):
-        self.config = config
+        self.config    = config
+        proxy_cfg      = config.get("proxy") or {}
+        self.proxy_url = proxy_cfg.get("url", "")
+        self.headless  = config.get("selenium_headless", True)
 
-    # ============================================================
-    #  AVITO
-    # ============================================================
-    def _avito_session(self) -> requests.Session:
-        s = requests.Session()
-        ua = _random_ua()
-        s.headers.update(
-            {
-                "User-Agent": ua,
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-                "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
-                "Accept-Encoding": "gzip, deflate, br",
-                "Connection": "keep-alive",
-                "Upgrade-Insecure-Requests": "1",
-                "Sec-Fetch-Dest": "document",
-                "Sec-Fetch-Mode": "navigate",
-                "Sec-Fetch-Site": "none",
-                "Sec-Fetch-User": "?1",
-                "Cache-Control": "max-age=0",
-            }
-        )
-        # Получаем куки с главной страницы (имитируем первый заход)
-        try:
-            s.get("https://www.avito.ru/", timeout=15)
-            _sleep(1.5, 3.0)
-        except Exception:
-            pass
-        return s
-
-    def build_avito_url(self, search_params: dict) -> str:
-        region = search_params.get("region", "rossiya")
-        brand = search_params.get("brand", "").lower().replace(" ", "_")
-        model = search_params.get("model", "").lower().replace(" ", "_")
-
+    # ─── AVITO ──────────────────────────────────────────────────── #
+    def build_avito_url(self, p: dict) -> str:
+        region = p.get("region", "rossiya")
+        brand  = p.get("brand", "").lower().replace(" ", "_")
+        model  = p.get("model", "").lower().replace(" ", "_")
         if brand and model:
             path = f"/{region}/avtomobili/{brand}/{model}/cars"
         elif brand:
             path = f"/{region}/avtomobili/{brand}/cars"
         else:
             path = f"/{region}/avtomobili/cars"
-
-        params = []
-        if search_params.get("price_min"):
-            params.append(f"pmin={search_params['price_min']}")
-        if search_params.get("price_max"):
-            params.append(f"pmax={search_params['price_max']}")
-        if search_params.get("year_min"):
-            params.append(f"params[201][from]={search_params['year_min']}")
-        if search_params.get("year_max"):
-            params.append(f"params[201][to]={search_params['year_max']}")
-        if search_params.get("mileage_max"):
-            params.append(f"params[922][to]={search_params['mileage_max']}")
-
+        qs: dict = {}
+        if p.get("price_min"):   qs["pmin"]              = p["price_min"]
+        if p.get("price_max"):   qs["pmax"]              = p["price_max"]
+        if p.get("year_min"):    qs["params[201][from]"] = p["year_min"]
+        if p.get("year_max"):    qs["params[201][to]"]   = p["year_max"]
+        if p.get("mileage_max"): qs["params[922][to]"]   = p["mileage_max"]
         url = "https://www.avito.ru" + path
-        if params:
-            url += "?" + "&".join(params)
+        if qs:
+            url += "?" + urlencode(qs)
         return url
 
-    def parse_avito(self, search_params: dict) -> list[dict]:
-        url = self.build_avito_url(search_params)
-        ads = []
-        max_retries = 3
-
-        for attempt in range(1, max_retries + 1):
-            try:
-                session = self._avito_session()
-                resp = session.get(url, timeout=30, allow_redirects=True)
-
-                if resp.status_code == 429:
-                    wait = 60 * attempt  # 60, 120, 180 сек
-                    logger.warning(
-                        f"Avito 429 (попытка {attempt}/{max_retries}). "
-                        f"Ждём {wait}s..."
-                    )
-                    time.sleep(wait)
-                    continue
-
-                if resp.status_code == 403:
-                    logger.warning("Avito 403 — возможно, нужен прокси. Пропускаем.")
-                    break
-
-                resp.raise_for_status()
-                soup = BeautifulSoup(resp.text, "html.parser")
-
-                # Avito рендерит данные в JSON внутри <script>
-                ads = self._parse_avito_json_state(soup)
-
-                if not ads:
-                    # Fallback: HTML-парсинг
-                    ads = self._parse_avito_html(soup)
-
-                logger.info(
-                    f"Avito: найдено {len(ads)} объявлений "
-                    f"для '{search_params.get('name', '')}'"
-                )
-                break
-
-            except requests.exceptions.HTTPError as e:
-                logger.error(f"Avito HTTP ошибка: {e}")
-                break
-            except Exception as e:
-                logger.error(f"Avito ошибка (попытка {attempt}): {e}")
-                if attempt < max_retries:
-                    _sleep(10, 20)
-
+    def parse_avito(self, search_params: dict) -> list:
+        url  = self.build_avito_url(search_params)
+        name = search_params.get("name", "—")
+        logger.info(f"[Avito] Открываем Chrome -> {url}")
+        with _driver_ctx(proxy_url=self.proxy_url, headless=self.headless) as driver:
+            if driver is None:
+                return []
+            ads = self._load_avito(driver, url)
+        logger.info(f"[Avito] Найдено {len(ads)} объявлений для '{name}'")
         return ads
 
-    def _parse_avito_json_state(self, soup: BeautifulSoup) -> list[dict]:
-        """Avito вкладывает данные листинга в window.__initialData__ или похожий JSON."""
+    def _load_avito(self, driver, url: str) -> list:
         ads = []
-        for script in soup.find_all("script"):
-            text = script.string or ""
-            # Пробуем найти массив items в JSON-данных страницы
-            match = re.search(r'"items"\s*:\s*(\[.*?\])\s*[,}]', text, re.DOTALL)
+        try:
+            driver.get(url)
+            time.sleep(_jitter(4, 0.3))
+            if _is_blocked(driver):
+                logger.warning("[Avito] Обнаружена капча/блокировка. Ждём 40s и обновляем...")
+                time.sleep(_jitter(40, 0.15))
+                driver.refresh()
+                time.sleep(_jitter(8, 0.3))
+            card_sel = _wait_for_any(driver, [
+                "[data-marker='item']",
+                "[class*='iva-item-root']",
+                "div[class*='items-items'] > div",
+            ], timeout=20)
+            if card_sel:
+                _scroll_page(driver)
+            else:
+                logger.warning("[Avito] Карточки не появились, пробуем JSON-LD")
+            soup = BeautifulSoup(driver.page_source, "lxml")
+            ads  = self._avito_jsonld(soup)
+            if not ads:
+                ads = self._avito_html(soup)
+        except WebDriverException as e:
+            logger.error(f"[Avito] Selenium error: {e}")
+        return ads
+
+    @staticmethod
+    def _avito_jsonld(soup: BeautifulSoup) -> list:
+        ads = []
+        for tag in soup.find_all("script", type="application/ld+json"):
+            try:
+                data  = json.loads(tag.string or "")
+                items = data.get("itemListElement", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
+                for it in items:
+                    item  = it.get("item", it)
+                    url   = item.get("url", "")
+                    if not url or "avito.ru" not in url:
+                        continue
+                    mid   = re.search(r"/(\d+)/?$", url)
+                    price = item.get("offers", {}).get("price", "")
+                    ads.append({
+                        "id":       f"avito_{mid.group(1) if mid else url}",
+                        "source":   "Avito",
+                        "title":    item.get("name", "—"),
+                        "price":    f"{price} ₽" if str(price).isdigit() else str(price or "Цена не указана"),
+                        "url":      url,
+                        "location": item.get("availableAtOrFrom", {}).get("name", ""),
+                        "found_at": datetime.now().isoformat(),
+                    })
+            except Exception:
+                pass
+        return ads
+
+    @staticmethod
+    def _avito_html(soup: BeautifulSoup) -> list:
+        ads   = []
+        items = []
+        for sel in ["div[data-marker='item']", "div[class*='iva-item-root']", "article[class*='item']"]:
+            items = soup.select(sel)
+            if items:
+                break
+        for item in items:
+            ad_id = item.get("data-item-id") or item.get("id", "")
+            if not ad_id:
+                continue
+            title_el = item.select_one("[itemprop='name'], [class*='title-root'], h3, h2")
+            price_el = item.select_one("[itemprop='price'], [class*='price-text'], [class*='price_value'], [class*='price-root']")
+            link_el  = item.select_one("a[href*='/avtomobili/']") or item.select_one("a[data-marker='item-title']")
+            geo_el   = item.select_one("[class*='geo-root'], [class*='location'], [data-marker='item-address']")
+            href = link_el["href"] if link_el else ""
+            ads.append({
+                "id":       f"avito_{ad_id}",
+                "source":   "Avito",
+                "title":    title_el.get_text(strip=True) if title_el else "—",
+                "price":    price_el.get_text(strip=True) if price_el else "Цена не указана",
+                "url":      f"https://www.avito.ru{href}" if href.startswith("/") else href,
+                "location": geo_el.get_text(strip=True)  if geo_el   else "",
+                "found_at": datetime.now().isoformat(),
+            })
+        return ads
+
+    # ─── AUTO.RU ────────────────────────────────────────────────── #
+    _BRAND_SLUG = {
+        "mitsubishi": "mitsubishi", "toyota": "toyota", "bmw": "bmw",
+        "honda": "honda", "kia": "kia", "hyundai": "hyundai",
+        "volkswagen": "volkswagen", "mercedes": "mercedes-benz",
+        "nissan": "nissan", "ford": "ford", "skoda": "skoda",
+        "lada": "vaz", "renault": "renault", "chevrolet": "chevrolet",
+        "audi": "audi", "mazda": "mazda", "subaru": "subaru",
+        "lexus": "lexus", "volvo": "volvo", "peugeot": "peugeot",
+        "suzuki": "suzuki", "jeep": "jeep", "land_rover": "land_rover",
+        "porsche": "porsche", "infiniti": "infiniti",
+        "geely": "geely", "chery": "chery", "haval": "haval",
+    }
+
+    def build_autoru_url(self, p: dict) -> str:
+        brand_key = p.get("brand", "").lower().replace(" ", "_").replace("-", "_")
+        brand     = self._BRAND_SLUG.get(brand_key, brand_key)
+        model     = p.get("model", "").lower().replace(" ", "_").replace("-", "_")
+        if brand and model:
+            path = f"/cars/used/sale/{brand}/{model}/all/"
+        elif brand:
+            path = f"/cars/used/sale/{brand}/all/"
+        else:
+            path = "/cars/used/sale/all/all/"
+        qs: dict = {}
+        if p.get("price_min"):   qs["price_from"] = p["price_min"]
+        if p.get("price_max"):   qs["price_to"]   = p["price_max"]
+        if p.get("year_min"):    qs["year_from"]  = p["year_min"]
+        if p.get("year_max"):    qs["year_to"]    = p["year_max"]
+        if p.get("mileage_max"): qs["km_age_to"]  = p["mileage_max"]
+        url = "https://auto.ru" + path
+        if qs:
+            url += "?" + urlencode(qs)
+        return url
+
+    def parse_autoru(self, search_params: dict) -> list:
+        url  = self.build_autoru_url(search_params)
+        name = search_params.get("name", "—")
+        logger.info(f"[Auto.ru] Открываем Chrome -> {url}")
+        with _driver_ctx(proxy_url=self.proxy_url, headless=self.headless) as driver:
+            if driver is None:
+                return []
+            ads = self._load_autoru(driver, url)
+        logger.info(f"[Auto.ru] Найдено {len(ads)} объявлений для '{name}'")
+        return ads
+
+    def _load_autoru(self, driver, url: str) -> list:
+        ads = []
+        try:
+            driver.get(url)
+            time.sleep(_jitter(4, 0.3))
+            if _is_blocked(driver):
+                logger.warning("[Auto.ru] Обнаружена капча/блокировка. Ждём 40s...")
+                time.sleep(_jitter(40, 0.15))
+                driver.refresh()
+                time.sleep(_jitter(8, 0.3))
+            self._autoru_accept_cookies(driver)
+            card_sel = _wait_for_any(driver, [
+                "div.ListingItem",
+                "article.ListingItem",
+                "div[class*='ListingItem_']",
+                "div[class*='listing-item']",
+            ], timeout=25)
+            if not card_sel:
+                logger.warning("[Auto.ru] Карточки не найдены, пробуем JSON из страницы")
+                soup = BeautifulSoup(driver.page_source, "lxml")
+                return self._autoru_from_page_json(soup)
+            _scroll_page(driver)
+            soup = BeautifulSoup(driver.page_source, "lxml")
+            ads  = self._autoru_from_page_json(soup)
+            if not ads:
+                ads = self._autoru_from_html(soup)
+        except WebDriverException as e:
+            logger.error(f"[Auto.ru] Selenium error: {e}")
+        return ads
+
+    @staticmethod
+    def _autoru_accept_cookies(driver):
+        for sel in [
+            "button[data-id='cookie-agreement-button']",
+            ".CookieAgreement__button",
+            "[class*='cookie'] button",
+        ]:
+            try:
+                btn = driver.find_element(By.CSS_SELECTOR, sel)
+                btn.click()
+                time.sleep(_jitter(0.8))
+                break
+            except (NoSuchElementException, WebDriverException):
+                pass
+
+    @staticmethod
+    def _autoru_from_page_json(soup: BeautifulSoup) -> list:
+        ads = []
+        for tag in soup.find_all("script"):
+            src = tag.string or ""
+            match = re.search(r'"offers"\s*:\s*(\[.*?\])\s*[,}]', src, re.DOTALL)
             if not match:
                 continue
             try:
-                items_raw = json.loads(match.group(1))
-                for item in items_raw:
-                    ad = self._map_avito_json_item(item)
+                offers = json.loads(match.group(1))
+                for offer in offers:
+                    ad = CarParser._parse_autoru_offer(offer)
                     if ad:
                         ads.append(ad)
                 if ads:
                     break
             except Exception:
-                continue
+                pass
         return ads
 
-    def _map_avito_json_item(self, item: dict) -> Optional[dict]:
-        ad_id = str(item.get("id", ""))
-        if not ad_id:
-            return None
-        title = item.get("title", "Без названия")
-        price_obj = item.get("priceDetailed") or item.get("price", {})
-        if isinstance(price_obj, dict):
-            price = price_obj.get("string") or price_obj.get("value", "Цена не указана")
-        else:
-            price = str(price_obj) if price_obj else "Цена не указана"
-        url_part = item.get("urlPath", "")
-        link = f"https://www.avito.ru{url_part}" if url_part else ""
-        location = item.get("location", {}).get("name", "") if isinstance(item.get("location"), dict) else ""
-        return {
-            "id": f"avito_{ad_id}",
-            "source": "Avito",
-            "title": title,
-            "price": str(price),
-            "url": link,
-            "location": location,
-            "found_at": datetime.now().isoformat(),
-        }
-
-    def _parse_avito_html(self, soup: BeautifulSoup) -> list[dict]:
-        ads = []
-        items = soup.select("div[data-marker='item']")
+    @staticmethod
+    def _autoru_from_html(soup: BeautifulSoup) -> list:
+        ads   = []
+        items = []
+        for sel in ["div.ListingItem", "article.ListingItem", "div[class*='ListingItem_']", "div[class*='listing-item']"]:
+            items = soup.select(sel)
+            if items:
+                break
         if not items:
-            items = soup.select("div[class*='iva-item-root']")
+            links = soup.find_all("a", href=re.compile(r"/cars/used/sale/.+/\d+-\w+/"))
+            seen: set = set()
+            for a in links:
+                href = a.get("href", "")
+                if href in seen:
+                    continue
+                seen.add(href)
+                m = re.search(r"/sale/[^/]+/[^/]+/(\d+-[a-f0-9]+)/", href)
+                ads.append({
+                    "id":       f"autoru_{m.group(1) if m else href}",
+                    "source":   "Auto.ru",
+                    "title":    a.get_text(strip=True) or "—",
+                    "price":    "см. ссылку",
+                    "url":      href if href.startswith("http") else f"https://auto.ru{href}",
+                    "location": "",
+                    "found_at": datetime.now().isoformat(),
+                })
+            return ads
         for item in items:
             try:
-                ad = self._extract_avito_html_item(item)
-                if ad:
-                    ads.append(ad)
+                link_el  = item.select_one("a[href*='/cars/used/sale/']")
+                if not link_el:
+                    continue
+                href     = link_el.get("href", "")
+                m        = re.search(r"/sale/[^/]+/[^/]+/(\d+-[a-f0-9]+)/", href)
+                oid      = m.group(1) if m else href
+                title_el = item.select_one(".ListingItemTitle__link, [class*='ItemTitle'], [class*='title'], h3, h2")
+                price_el = item.select_one(".ListingItem__priceValue, [class*='Price_'], [class*='price-value'], [class*='Price__content']")
+                geo_el   = item.select_one(".MetroListPlace__regionName, [class*='Place_'], [class*='place'], [class*='region']")
+                year_el  = item.select_one("[class*='year'], .ListingItem__yearMileage")
+                km_el    = item.select_one("[class*='mileage'], [class*='km']")
+                ads.append({
+                    "id":       f"autoru_{oid}",
+                    "source":   "Auto.ru",
+                    "title":    title_el.get_text(strip=True) if title_el else "—",
+                    "price":    price_el.get_text(strip=True) if price_el else "Цена не указана",
+                    "url":      href if href.startswith("http") else f"https://auto.ru{href}",
+                    "location": geo_el.get_text(strip=True)  if geo_el  else "",
+                    "year":     year_el.get_text(strip=True) if year_el else "",
+                    "mileage":  km_el.get_text(strip=True)   if km_el   else "",
+                    "found_at": datetime.now().isoformat(),
+                })
             except Exception as e:
-                logger.debug(f"Avito HTML item error: {e}")
+                logger.debug(f"[Auto.ru] item parse error: {e}")
         return ads
 
-    def _extract_avito_html_item(self, item) -> Optional[dict]:
-        ad_id = item.get("data-item-id") or item.get("id", "")
-        if not ad_id:
+    @staticmethod
+    def _parse_autoru_offer(offer: dict) -> Optional[dict]:
+        oid = offer.get("id", "")
+        if not oid:
             return None
-        title_el = item.select_one("[itemprop='name'], [class*='title-root'], h3")
-        title = title_el.get_text(strip=True) if title_el else "Без названия"
-        price_el = item.select_one("[itemprop='price'], [class*='price-text'], [class*='price_value']")
-        price = price_el.get_text(strip=True) if price_el else "Цена не указана"
-        link_el = item.select_one("a[data-marker='item-title'], a[href*='/avtomobili/']")
-        link = ""
-        if link_el:
-            href = link_el.get("href", "")
-            link = f"https://www.avito.ru{href}" if href.startswith("/") else href
-        geo_el = item.select_one("[data-marker='item-address'], [class*='geo-root']")
-        location = geo_el.get_text(strip=True) if geo_el else ""
+        car   = offer.get("car_info", {})
+        docs  = offer.get("documents", {})
+        price = offer.get("price_info", {}).get("price", 0)
+        loc   = offer.get("seller", {}).get("location", {})
+        state = offer.get("state", {})
+        title = " ".join(filter(None, [
+            car.get("mark_info",  {}).get("name", ""),
+            car.get("model_info", {}).get("name", ""),
+            str(docs.get("year", "")),
+        ])) or "—"
+        price_str = f"{price:,}".replace(",", "\u00a0") + "\u00a0\u20bd" if price else "Цена не указана"
+        region    = loc.get("region_info", {}).get("name", "") or loc.get("city_name", "")
         return {
-            "id": f"avito_{ad_id}",
-            "source": "Avito",
-            "title": title,
-            "price": price,
-            "url": link,
-            "location": location,
+            "id":       f"autoru_{oid}",
+            "source":   "Auto.ru",
+            "title":    title,
+            "price":    price_str,
+            "url":      f"https://auto.ru/cars/used/sale/{oid}/",
+            "location": region,
+            "year":     str(docs.get("year", "")),
+            "mileage":  str(state.get("mileage", "")),
             "found_at": datetime.now().isoformat(),
         }
-
-    # ============================================================
-    #  AUTO.RU  — через публичный API (search)
-    # ============================================================
-    # Auto.ru использует внутренний REST API, который возвращает JSON.
-    # Он не требует авторизации для базового поиска.
-
-    _AUTORU_API = "https://auto.ru/-/ajax/desktop/listing/"
-
-    # Словарь категорий марок для API auto.ru
-    # (если марки нет — используем поиск по параметрам)
-
-    def _autoru_api_payload(self, search_params: dict) -> dict:
-        brand = search_params.get("brand", "").upper()
-        model = search_params.get("model", "").upper().replace("-", "_")
-
-        payload: dict = {
-            "category": "cars",
-            "section": "used",
-            "output_type": "list",
-            "page": 1,
-            "page_size": 50,
-        }
-
-        if brand:
-            payload["catalog_filter"] = [{"mark": brand, "model": model} if model else {"mark": brand}]
-
-        if search_params.get("price_min"):
-            payload["price_from"] = int(search_params["price_min"])
-        if search_params.get("price_max"):
-            payload["price_to"] = int(search_params["price_max"])
-        if search_params.get("year_min"):
-            payload["year_from"] = int(search_params["year_min"])
-        if search_params.get("year_max"):
-            payload["year_to"] = int(search_params["year_max"])
-        if search_params.get("mileage_max"):
-            payload["km_age_to"] = int(search_params["mileage_max"])
-
-        return payload
-
-    def parse_autoru(self, search_params: dict) -> list[dict]:
-        ads = []
-        payload = self._autoru_api_payload(search_params)
-        headers = {
-            "User-Agent": _random_ua(),
-            "Accept": "application/json",
-            "Content-Type": "application/json",
-            "Referer": "https://auto.ru/",
-            "Origin": "https://auto.ru",
-            "x-client-app-version": "202403.01.0",
-            "x-page-request-id": "".join(random.choices("0123456789abcdef", k=32)),
-        }
-
-        try:
-            resp = requests.post(
-                self._AUTORU_API,
-                json=payload,
-                headers=headers,
-                timeout=30,
-            )
-
-            if resp.status_code in (401, 403):
-                # Fallback на HTML-парсинг если API закрыт
-                logger.warning("Auto.ru API вернул 403, пробуем HTML-парсинг...")
-                return self._parse_autoru_html(search_params)
-
-            resp.raise_for_status()
-            data = resp.json()
-
-            offers = data.get("offers", [])
-            for offer in offers:
-                ad = self._map_autoru_offer(offer)
-                if ad:
-                    ads.append(ad)
-
-            logger.info(
-                f"Auto.ru API: найдено {len(ads)} объявлений "
-                f"для '{search_params.get('name', '')}'"
-            )
-
-        except requests.exceptions.JSONDecodeError:
-            logger.warning("Auto.ru API вернул не JSON, пробуем HTML...")
-            return self._parse_autoru_html(search_params)
-        except Exception as e:
-            logger.error(f"Auto.ru API ошибка: {e}")
-            return self._parse_autoru_html(search_params)
-
-        return ads
-
-    def _map_autoru_offer(self, offer: dict) -> Optional[dict]:
-        ad_id = offer.get("id", "")
-        if not ad_id:
-            return None
-
-        # Название: марка + модель + год
-        car = offer.get("vehicle_info", {})
-        mark = car.get("mark_info", {}).get("name", "")
-        model = car.get("model_info", {}).get("name", "")
-        year = str(offer.get("documents", {}).get("year", ""))
-        title = " ".join(filter(None, [mark, model, year])) or "Авто"
-
-        # Цена
-        price_info = offer.get("price_info", {})
-        price_rub = price_info.get("price", 0)
-        price = f"{price_rub:,}".replace(",", " ") + " ₽" if price_rub else "Цена не указана"
-
-        # Ссылка
-        link = offer.get("url", "") or f"https://auto.ru/cars/used/sale/{ad_id}/"
-
-        # Пробег
-        mileage = offer.get("state", {}).get("mileage", "")
-        mileage_str = f"{mileage:,} км".replace(",", " ") if mileage else ""
-
-        # Город
-        seller = offer.get("seller", {})
-        location_info = seller.get("location", {})
-        city = location_info.get("region_info", {}).get("name", "") or location_info.get("address", "")
-
-        return {
-            "id": f"autoru_{ad_id}",
-            "source": "Auto.ru",
-            "title": title,
-            "price": price,
-            "url": link,
-            "location": city,
-            "year": year,
-            "mileage": mileage_str,
-            "found_at": datetime.now().isoformat(),
-        }
-
-    # HTML fallback для Auto.ru
-    def _parse_autoru_html(self, search_params: dict) -> list[dict]:
-        brand = search_params.get("brand", "all").lower().replace(" ", "_")
-        model = search_params.get("model", "").lower().replace(" ", "_")
-        url = (
-            f"https://auto.ru/cars/used/sale/{brand}/{model or 'all'}/"
-        )
-        params = []
-        if search_params.get("price_min"):
-            params.append(f"price_from={search_params['price_min']}")
-        if search_params.get("price_max"):
-            params.append(f"price_to={search_params['price_max']}")
-        if search_params.get("year_min"):
-            params.append(f"year_from={search_params['year_min']}")
-        if search_params.get("year_max"):
-            params.append(f"year_to={search_params['year_max']}")
-        if params:
-            url += "?" + "&".join(params)
-
-        ads = []
-        try:
-            headers = {
-                "User-Agent": _random_ua(),
-                "Accept": "text/html,application/xhtml+xml,*/*;q=0.9",
-                "Accept-Language": "ru-RU,ru;q=0.9",
-                "Referer": "https://auto.ru/",
-            }
-            resp = requests.get(url, headers=headers, timeout=30)
-            resp.raise_for_status()
-            soup = BeautifulSoup(resp.text, "html.parser")
-
-            # Auto.ru также прячет данные в JSON
-            for script in soup.find_all("script"):
-                text = script.string or ""
-                if '"offers"' in text and '"listing"' in text:
-                    m = re.search(r'"offers"\s*:\s*(\[.+?\])\s*,\s*"', text, re.DOTALL)
-                    if m:
-                        try:
-                            offers = json.loads(m.group(1))
-                            for offer in offers:
-                                ad = self._map_autoru_offer(offer)
-                                if ad:
-                                    ads.append(ad)
-                            break
-                        except Exception:
-                            pass
-
-            if not ads:
-                # Совсем базовый HTML fallback
-                items = soup.select("div.ListingItem, article[class*='ListingItem']")
-                for item in items:
-                    link_el = item.select_one("a[href*='/cars/used/sale/']")
-                    if not link_el:
-                        continue
-                    href = link_el.get("href", "")
-                    id_m = re.search(r"/(\d+-[a-f0-9]+)/?$", href)
-                    if not id_m:
-                        continue
-                    ad_id = id_m.group(1)
-                    title_el = item.select_one("h3, [class*='ItemTitle']")
-                    title = title_el.get_text(strip=True) if title_el else "Авто"
-                    price_el = item.select_one("[class*='priceValue'], [class*='Price']")
-                    price = price_el.get_text(strip=True) if price_el else "Цена не указана"
-                    link = href if href.startswith("http") else f"https://auto.ru{href}"
-                    ads.append({
-                        "id": f"autoru_{ad_id}",
-                        "source": "Auto.ru",
-                        "title": title,
-                        "price": price,
-                        "url": link,
-                        "location": "",
-                        "found_at": datetime.now().isoformat(),
-                    })
-
-            logger.info(f"Auto.ru HTML: найдено {len(ads)} объявлений для '{search_params.get('name', '')}'")
-        except Exception as e:
-            logger.error(f"Auto.ru HTML ошибка: {e}")
-
-        return ads
