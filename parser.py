@@ -106,16 +106,52 @@ def _make_options(proxy_url: str = "", headless: bool = True) -> Options:
 
 
 def _make_service() -> Service:
-    """Создаёт Service: если есть webdriver-manager — использует его,
-    иначе полагается на chromedriver в PATH."""
+    """
+    Находит chromedriver и возвращает Service.
+
+    Порядок поиска:
+      1. chromedriver в PATH (установлен install.sh через wget/apt)
+      2. webdriver-manager — с явным поиском бинарника в папке
+         (wdm >= 4.x кладёт рядом THIRD_PARTY_NOTICES, нужен сам бинарник)
+    """
+    import os
+    import stat
+    import shutil
+
+    # ── 1. chromedriver в PATH — самый надёжный вариант ──
+    in_path = shutil.which("chromedriver")
+    if in_path:
+        logger.info(f"ChromeDriver из PATH: {in_path}")
+        return Service(in_path)
+
+    # ── 2. webdriver-manager как запасной вариант ──
     if _WDM_AVAILABLE:
         try:
-            driver_path = ChromeDriverManager().install()
-            logger.info(f"ChromeDriver: {driver_path}")
-            return Service(driver_path)
+            raw_path = ChromeDriverManager().install()
+            logger.info(f"webdriver-manager: {raw_path}")
+
+            # Проверяем сам путь
+            if os.path.isfile(raw_path) and os.access(raw_path, os.X_OK):
+                return Service(raw_path)
+
+            # wdm вернул не бинарник (например THIRD_PARTY_NOTICES) —
+            # ищем файл с именем 'chromedriver' в той же директории
+            search_root = os.path.dirname(raw_path)
+            for dirpath, _, filenames in os.walk(search_root):
+                for fname in filenames:
+                    if fname in ("chromedriver", "chromedriver.exe"):
+                        full = os.path.join(dirpath, fname)
+                        os.chmod(full, os.stat(full).st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+                        logger.info(f"ChromeDriver найден через wdm: {full}")
+                        return Service(full)
         except Exception as e:
-            logger.warning(f"webdriver-manager не смог скачать драйвер ({e}), пробуем из PATH...")
-    return Service()
+            logger.warning(f"webdriver-manager ошибка: {e}")
+
+    raise RuntimeError(
+        "chromedriver не найден!\n"
+        "Запустите install.sh или установите вручную:\n"
+        "  sudo apt install chromium-chromedriver"
+    )
 
 
 @contextmanager
