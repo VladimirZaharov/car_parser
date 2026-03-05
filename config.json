@@ -8,33 +8,33 @@
 
   "search_queries": [
     {
-      "name": "Toyota Camry до 2млн",
+      "name": "mitsubishi outlander",
       "sources": ["avito", "autoru"],
-      "brand": "toyota",
-      "model": "camry",
-      "year_min": 2018,
-      "year_max": 2023,
-      "price_min": 1000000,
-      "price_max": 2000000,
-      "mileage_max": 100000,
-      "region": "moskva"
+      "brand": "mitsubishi",
+      "model": "outlander",
+      "year_min": 2012,
+      "year_max": 2013,
+      "price_min": 900000,
+      "price_max": 1300000,
+      "mileage_max": 200000,
+      "region": "rossiya"
     },
     {
-      "name": "BMW 3 series бюджет",
+      "name": "moscvich 3",
       "sources": ["avito", "autoru"],
-      "brand": "bmw",
-      "model": "3_seriya",
-      "year_min": 2017,
-      "price_max": 2500000,
-      "region": "sankt-peterburg"
+      "brand": "moscvich",
+      "model": "3",
+      "year_min": 2022,
+      "price_max": 1300000,
+      "region": "rossiya"
     },
     {
-      "name": "Honda CR-V по всей России",
-      "sources": ["avito"],
-      "brand": "honda",
-      "model": "cr-v",
-      "year_min": 2019,
-      "price_max": 3000000,
+      "name": "kia cerato",
+      "sources": ["avito", "autoru"],
+      "brand": "kia",
+      "model": "cerato",
+      "year_min": 2016,
+      "price_max": 1300000,
       "region": "rossiya"
     }
   ]

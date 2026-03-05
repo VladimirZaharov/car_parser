@@ -1,7 +1,8 @@
 import asyncio
 import json
 import logging
-import os
+import random
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -55,21 +56,23 @@ async def send_telegram_message(bot: Bot, chat_id: str, text: str):
 
 def format_ad_message(ad: dict, query_name: str) -> str:
     lines = [
-        f"🚗 <b>Новое объявление!</b> [{ad['source']}]",
-        f"🔍 Запрос: <i>{query_name}</i>",
-        f"📋 {ad['title']}",
+        f"🚗 <b>Новое объявление!</b>  [{ad['source']}]",
+        f"🔍 <i>{query_name}</i>",
+        f"",
+        f"📋 <b>{ad['title']}</b>",
         f"💰 {ad['price']}",
     ]
-    if ad.get("year"):
-        lines.append(f"📅 Год: {ad['year']}")
+    if ad.get("mileage"):
+        lines.append(f"🔢 Пробег: {ad['mileage']}")
     if ad.get("location"):
         lines.append(f"📍 {ad['location']}")
-    lines.append(f"🔗 <a href=\"{ad['url']}\">Открыть объявление</a>")
-    lines.append(f"⏰ {ad['found_at'][:19].replace('T', ' ')}")
+    lines.append(f"")
+    lines.append(f"🔗 <a href=\"{ad['url']}\">Открыть объявление →</a>")
+    lines.append(f"<i>⏰ {ad['found_at'][:19].replace('T', ' ')}</i>")
     return "\n".join(lines)
 
 
-async def run_once(config: dict, bot: Bot, seen_ids: set):
+async def run_once(config: dict, bot: Bot, seen_ids: set) -> int:
     car_parser = CarParser(config)
     chat_id = config["telegram"]["chat_id"]
     new_count = 0
@@ -78,28 +81,41 @@ async def run_once(config: dict, bot: Bot, seen_ids: set):
         query_name = query.get("name", "Без имени")
         sources = query.get("sources", ["avito", "autoru"])
 
-        all_ads = []
-
+        # Avito
         if "avito" in sources:
             ads = car_parser.parse_avito(query)
-            all_ads.extend(ads)
+            for ad in ads:
+                if ad["id"] not in seen_ids:
+                    seen_ids.add(ad["id"])
+                    msg = format_ad_message(ad, query_name)
+                    await send_telegram_message(bot, chat_id, msg)
+                    new_count += 1
+                    await asyncio.sleep(1.5)
 
+            # Пауза между Avito и Auto.ru для одного запроса
+            if "autoru" in sources:
+                delay = random.uniform(5, 12)
+                logger.debug(f"Пауза {delay:.1f}s между источниками...")
+                await asyncio.sleep(delay)
+
+        # Auto.ru
         if "autoru" in sources:
             ads = car_parser.parse_autoru(query)
-            all_ads.extend(ads)
+            for ad in ads:
+                if ad["id"] not in seen_ids:
+                    seen_ids.add(ad["id"])
+                    msg = format_ad_message(ad, query_name)
+                    await send_telegram_message(bot, chat_id, msg)
+                    new_count += 1
+                    await asyncio.sleep(1.5)
 
-        for ad in all_ads:
-            if ad["id"] not in seen_ids:
-                seen_ids.add(ad["id"])
-                msg = format_ad_message(ad, query_name)
-                await send_telegram_message(bot, chat_id, msg)
-                new_count += 1
-                logger.info(f"New ad sent: {ad['id']} — {ad['title']}")
-                # Small delay between messages to avoid flood limit
-                await asyncio.sleep(1)
+        # Пауза между запросами (важно для Avito!)
+        delay = random.uniform(8, 20)
+        logger.debug(f"Пауза {delay:.1f}s перед следующим запросом...")
+        await asyncio.sleep(delay)
 
     save_seen_ids(seen_ids)
-    logger.info(f"Scan complete. New ads found: {new_count}")
+    logger.info(f"Скан завершён. Новых объявлений: {new_count}")
     return new_count
 
 
@@ -110,36 +126,39 @@ async def main():
 
     bot = Bot(token=bot_token)
 
-    # Verify bot connection
     try:
         me = await bot.get_me()
-        logger.info(f"Bot started: @{me.username}")
+        logger.info(f"Бот запущен: @{me.username}")
     except TelegramError as e:
-        logger.error(f"Cannot connect to Telegram: {e}")
+        logger.error(f"Не удалось подключиться к Telegram: {e}")
         return
 
     seen_ids = load_seen_ids()
-    logger.info(f"Loaded {len(seen_ids)} previously seen ad IDs")
+    logger.info(f"Загружено {len(seen_ids)} ранее виденных ID")
 
-    # Send startup notification
     chat_id = config["telegram"]["chat_id"]
+    queries_info = "\n".join(
+        f"  • {q.get('name', '?')} [{', '.join(q.get('sources', ['avito','autoru']))}]"
+        for q in config["search_queries"]
+    )
     await send_telegram_message(
         bot,
         chat_id,
-        f"✅ <b>Парсер запущен!</b>\n"
+        f"✅ <b>Парсер запущен!</b>\n\n"
         f"📊 Запросов: {len(config['search_queries'])}\n"
+        f"{queries_info}\n\n"
         f"⏱ Интервал: каждые {interval_minutes} мин.",
     )
 
-    logger.info(f"Starting polling loop, interval={interval_minutes} min")
+    logger.info(f"Цикл опроса запущен, интервал={interval_minutes} мин")
 
     while True:
         try:
             await run_once(config, bot, seen_ids)
         except Exception as e:
-            logger.error(f"Error during scan: {e}", exc_info=True)
+            logger.error(f"Ошибка при сканировании: {e}", exc_info=True)
 
-        logger.info(f"Sleeping {interval_minutes} minutes until next scan...")
+        logger.info(f"Ждём {interval_minutes} минут до следующего скана...")
         await asyncio.sleep(interval_minutes * 60)
 
 
